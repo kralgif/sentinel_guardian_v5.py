@@ -1,3 +1,100 @@
+# ============================================================
+# --- VERSION & AUTO-UPDATE ---
+# ============================================================
+VERSION = "1.0.0"
+
+GITHUB_RAW_URL = (
+    "https://raw.githubusercontent.com/kralgif/Sentinel-SME-Guardian/main/"
+    "sentinel_guardian_v5.py"
+)
+UPDATE_INTERVAL_SECONDS = 3600  # 60 Minuten
+
+import sys, os, py_compile, tempfile, logging
+
+_update_logger = logging.getLogger("sentinel.updater")
+
+def _extract_version(source: str) -> str:
+    """Extrahiert VERSION="x.y.z" aus Quellcode-String."""
+    import re as _re
+    m = _re.search(r'^VERSION\s*=\s*["\']([^"\']+)["\']', source, _re.MULTILINE)
+    return m.group(1) if m else ""
+
+async def _check_and_apply_update():
+    """
+    Lädt den Raw-Code von GitHub, vergleicht die VERSION,
+    prüft Syntax und überschreibt ggf. die laufende Datei.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(GITHUB_RAW_URL)
+            if resp.status_code != 200:
+                _update_logger.warning(
+                    f"Auto-Update: HTTP {resp.status_code} von GitHub – kein Update."
+                )
+                return
+
+        remote_source = resp.text
+        remote_version = _extract_version(remote_source)
+
+        if not remote_version:
+            _update_logger.warning("Auto-Update: Keine VERSION im Remote-Code gefunden.")
+            return
+
+        if remote_version == VERSION:
+            _update_logger.info(
+                f"Auto-Update: Version {VERSION} ist aktuell – kein Update noetig."
+            )
+            return
+
+        _update_logger.info(
+            f"Auto-Update: Neue Version gefunden: {remote_version} "
+            f"(lokal: {VERSION}). Pruefe Syntax..."
+        )
+
+        # Syntax-Check in temporaerer Datei
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False, encoding="utf-8"
+        ) as tmp:
+            tmp.write(remote_source)
+            tmp_path = tmp.name
+
+        try:
+            py_compile.compile(tmp_path, doraise=True)
+        except py_compile.PyCompileError as e:
+            _update_logger.error(f"Auto-Update: Syntax-Fehler im Remote-Code – Update abgebrochen: {e}")
+            os.unlink(tmp_path)
+            return
+
+        # Syntax OK → aktuelle Datei überschreiben
+        current_file = os.path.abspath(__file__)
+        _update_logger.info(
+            f"Auto-Update: Syntax OK. Installiere v{remote_version} → {current_file}"
+        )
+
+        with open(current_file, "w", encoding="utf-8") as f:
+            f.write(remote_source)
+
+        os.unlink(tmp_path)
+        _update_logger.info("Auto-Update: Datei geschrieben. Starte Prozess neu...")
+
+        # Neustart via os.execv
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    except Exception as e:
+        _update_logger.error(f"Auto-Update: Unerwarteter Fehler: {e}")
+
+async def _auto_update_loop():
+    """Hintergrund-Task: prüft alle UPDATE_INTERVAL_SECONDS auf Updates."""
+    # Erster Check nach 60 Sekunden (nicht sofort beim Start)
+    await asyncio.sleep(60)
+    while True:
+        _update_logger.info("Auto-Update: Prüfe auf neue Version...")
+        await _check_and_apply_update()
+        await asyncio.sleep(UPDATE_INTERVAL_SECONDS)
+
+# ============================================================
+# --- IMPORTS ---
+# ============================================================
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel
@@ -8,6 +105,11 @@ import hashlib, urllib.parse, uuid, json, platform, subprocess, shutil, os, secr
 from collections import defaultdict
 
 app = FastAPI(title="Sentinel-AI SME-Guardian")
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(_auto_update_loop())
+    _update_logger.info(f"Sentinel SME-Guardian v{VERSION} gestartet. Auto-Update aktiv.")
 
 # ============================================================
 # --- 1. DATENBANK SETUP ---
@@ -2001,6 +2103,20 @@ def get_ai_status():
     conn.close()
     return {"ai_active": val}
 
+@app.get("/version")
+def get_version():
+    return {
+        "version": VERSION,
+        "github_url": GITHUB_RAW_URL,
+        "update_interval_minutes": UPDATE_INTERVAL_SECONDS // 60,
+    }
+
+@app.post("/update/check_now")
+async def trigger_update_check():
+    """Manuell einen Update-Check auslösen."""
+    asyncio.create_task(_check_and_apply_update())
+    return {"message": "Update-Check gestartet. Logs pruefen fuer Ergebnis."}
+
 @app.post("/toggle_ai")
 async def toggle_ai():
     conn = sqlite3.connect("sentinel.db")
@@ -2503,7 +2619,7 @@ async def dashboard():
     return f"""<!DOCTYPE html>
 <html>
 <head>
-<title>SME-Guardian | {company}</title>
+<title>SME-Guardian v{VERSION} | {company}</title>
 <style>
 *{{box-sizing:border-box;}}
 body{{font-family:sans-serif;background:#0a0c10;color:#cfd8dc;margin:0;padding:20px;}}
@@ -2666,6 +2782,11 @@ input:checked+.slider:before{{transform:translateX(22px);}}
   </div>
   <div class="admin-bar">
     Firma: <strong>{company}</strong> | KI: <strong id="kiStatus">{"AKTIV" if act=="1" else "DEAKTIVIERT"}</strong> | Filter: <strong>{bl}</strong>
+    &nbsp;<span style="color:#37474f;font-size:0.8rem;">|</span>&nbsp;
+    <span style="color:#4b5563;font-size:0.78rem;">v{VERSION}</span>
+    <span id="updateBadge" style="display:none;margin-left:6px;padding:2px 8px;background:#fbbf24;
+      color:#0a0c10;border-radius:4px;font-size:0.72rem;font-weight:bold;cursor:pointer;"
+      onclick="triggerUpdateCheck()">UPDATE VERFÜGBAR</span>
     <br><br>
     <label>Modell:</label>
     <select id="modelSelect" style="width:auto;display:inline-block;">{options_html}</select>
@@ -3115,6 +3236,35 @@ input:checked+.slider:before{{transform:translateX(22px);}}
         <button class="btn btn-blue btn-sm" onclick="testAlertEmail()">Test-Mail</button>
       </div>
     </div>
+  </div>
+  <div class="card">
+    <h3>Auto-Update</h3>
+    <div class="grid3">
+      <div class="info-box" style="margin:0;">
+        <small style="color:#90a4ae;">Aktuelle Version</small><br>
+        <strong style="color:#38bdf8;font-size:1.3rem;" id="localVersion">v{VERSION}</strong>
+      </div>
+      <div class="info-box" style="margin:0;">
+        <small style="color:#90a4ae;">Online-Version</small><br>
+        <strong style="color:#10b981;font-size:1.3rem;" id="remoteVersion">–</strong>
+      </div>
+      <div class="info-box" style="margin:0;">
+        <small style="color:#90a4ae;">Prüf-Intervall</small><br>
+        <strong style="color:#38bdf8;">60 Minuten</strong>
+      </div>
+    </div>
+    <div style="margin-top:12px;font-size:0.83rem;color:#90a4ae;">
+      GitHub:
+      <a href="https://github.com/kralgif/Sentinel-SME-Guardian" target="_blank"
+         style="color:#38bdf8;">github.com/kralgif/Sentinel-SME-Guardian</a><br>
+      Der Auto-Updater prüft alle 60 Minuten auf neue Versionen. Wenn eine neuere Version gefunden wird,
+      wird der Syntax geprüft, die Datei überschrieben und der Server automatisch neu gestartet.
+    </div>
+    <div style="margin-top:12px;display:flex;gap:8px;align-items:center;">
+      <button class="btn btn-blue" onclick="triggerUpdateCheck()">JETZT PRÜFEN</button>
+      <span id="updateCheckMsg" style="color:#90a4ae;font-size:0.83rem;"></span>
+    </div>
+    <div id="updateStatus" style="margin-top:10px;"></div>
   </div>
 </div>
 <script>
@@ -3868,9 +4018,35 @@ async function testOutlookScan() {{
       d.reasons.map(r => `<li>${{r}}</li>`).join('') + '</ul>' : ''}}
   `;
 }}
+
+// ── AUTO-UPDATE ──────────────────────────────────────────────
+async function triggerUpdateCheck() {{
+  const msg = document.getElementById('updateCheckMsg');
+  if(msg) msg.textContent = 'Prüfe auf Updates...';
+  try {{
+    await fetch('/update/check_now', {{method:'POST'}});
+    if(msg) msg.textContent = 'Update-Check ausgelöst. Ergebnis erscheint in Server-Logs.';
+    setTimeout(checkVersionDisplay, 2000);
+  }} catch(e) {{
+    if(msg) msg.textContent = 'Fehler: ' + e;
+  }}
+}}
+
+async function checkVersionDisplay() {{
+  try {{
+    const res  = await fetch('/version');
+    const data = await res.json();
+    const localEl = document.getElementById('localVersion');
+    if(localEl) localEl.textContent = 'v' + data.version;
+    const remoteEl = document.getElementById('remoteVersion');
+    if(remoteEl) remoteEl.textContent = 'v' + data.version + ' (bestätigt)';
+  }} catch(e) {{}}
+}}
+
 connectSSE();
 loadFpSnippet();
 loadAlarmSettings();
+checkVersionDisplay();
 </script>
 </body>
-</html>"""
+</html>"""    

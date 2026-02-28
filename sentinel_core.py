@@ -13,6 +13,112 @@ import sys, os, py_compile, tempfile, logging
 
 _update_logger = logging.getLogger("sentinel.updater")
 
+# ============================================================
+# --- TELEGRAM ALERT MODULE ---
+# ============================================================
+# Verschlüsselte Telegram-Zugangsdaten (geladen aus sentinel.key)
+# Lege eine Datei "sentinel.key" neben diese .py-Datei mit deinem
+# Fernet-Schlüssel, um die verschlüsselten Token-Daten zu entschlüsseln.
+# Zum Erzeugen: python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# Zum Verschlüsseln: python3 -c "from cryptography.fernet import Fernet; f=Fernet(open('sentinel.key','rb').read()); print(f.encrypt(b'DEIN_TOKEN'))"
+_T_DATA = b'gAAAAABns97N_C_X1vA9_E7R6T5Z4U3I2O1P0L9K8J7H6G5F4D3S2A1Q0W9E8R7T6Z5U4I3O2P1L9K8J7H6G5F4D3S2A1Q0W9E8R7T6Z5U4I3O2P1L9K8J7H6G5F4D3S2A1'
+_I_DATA = b'gAAAAABns97NH_G8F7D6S5A4Q3W2E1R0T9Z8U7I6O5P4L3K2J1H0G9F8D7S6A5Q4W3E2R1T0Z9U8I7O6P5'
+
+def _load_telegram_credentials():
+    """Lädt verschlüsselte Telegram-Daten aus sentinel.key neben der .py-Datei."""
+    try:
+        from cryptography.fernet import Fernet
+        key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sentinel.key")
+        with open(key_path, "rb") as f:
+            key = f.read().strip()
+        cipher = Fernet(key)
+        token   = cipher.decrypt(_T_DATA).decode()
+        chat_id = cipher.decrypt(_I_DATA).decode()
+        return token, chat_id
+    except Exception:
+        # Kein sentinel.key vorhanden oder Schlüssel falsch → Telegram deaktiviert
+        return None, None
+
+# Zugangsdaten einmalig beim Start laden
+TELEGRAM_TOKEN, TELEGRAM_CHAT_ID = _load_telegram_credentials()
+
+async def send_telegram_alert(message: str):
+    """Sendet eine Telegram-Nachricht bei Alarm. Schlägt lautlos fehl wenn nicht konfiguriert."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id":    TELEGRAM_CHAT_ID,
+        "text":       f"🚨 *SENTINEL ALARM*\n\n{message}",
+        "parse_mode": "Markdown"
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(url, json=payload)
+    except Exception:
+        pass  # Netzwerkfehler ignorieren – kein Absturz des Hauptprogramms
+
+def _send_telegram_sync(message: str):
+    """Synchroner Wrapper – wird in eigenem Thread aufgerufen."""
+    import asyncio as _asyncio
+    try:
+        loop = _asyncio.new_event_loop()
+        loop.run_until_complete(send_telegram_alert(message))
+        loop.close()
+    except Exception:
+        pass
+
+def _fire_telegram(severity: str, category: str, message: str, ip: str = ""):
+    """Schickt Telegram-Nachricht asynchron im Hintergrund (blockiert nicht)."""
+    import threading
+    def _task():
+        try:
+            # 1) Prüfe ob Telegram aktiv ist (DB-Setting)
+            conn = __import__('sqlite3').connect("sentinel.db")
+            cur  = conn.cursor()
+            def _gs(k, d=''):
+                cur.execute("SELECT value FROM settings WHERE key=?", (k,))
+                r = cur.fetchone(); return r[0] if r else d
+            active   = _gs('telegram_active', '1')
+            on_warn  = _gs('telegram_on_warn', '1')
+            db_token = _gs('telegram_token', '')
+            db_chat  = _gs('telegram_chat_id', '')
+            conn.close()
+            if active != '1':
+                return
+            if severity == 'WARNUNG' and on_warn != '1':
+                return
+            # 2) Token: key-Datei hat Vorrang, DB als Fallback
+            token   = TELEGRAM_TOKEN   or db_token
+            chat_id = TELEGRAM_CHAT_ID or db_chat
+            if not token or not chat_id:
+                return
+            # 3) Nachricht zusammenbauen & senden
+            now  = __import__('datetime').datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+            text = (
+                f"{'🔴' if severity == 'KRITISCH' else '🟡'} *{severity}* — {category}\n"
+                f"📋 {message}\n"
+                + (f"🌐 IP: {ip}\n" if ip else "")
+                + f"🕐 {now}"
+            )
+            import asyncio as _asyncio
+            loop = _asyncio.new_event_loop()
+            loop.run_until_complete(_send_telegram_direct(token, chat_id, text))
+            loop.close()
+        except Exception:
+            pass
+    threading.Thread(target=_task, daemon=True).start()
+
+async def _send_telegram_direct(token: str, chat_id: str, text: str):
+    """Sendet direkt mit gegebenen Credentials."""
+    url     = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(url, json=payload)
+    except Exception:
+        pass
+
 def _extract_version(source: str) -> str:
     """Extrahiert VERSION="x.y.z" aus Quellcode-String."""
     import re as _re
@@ -204,6 +310,10 @@ def init_db():
         'compliance_auto_send': '0',         # Auto-send on 1st of month
         'company_address': '',
         'company_logo_text': 'SENTINEL SME-GUARDIAN',
+        'telegram_token': '',       # Fallback: direkt in DB (unverschlüsselt)
+        'telegram_chat_id': '',     # Fallback: direkt in DB
+        'telegram_active': '1',     # Telegram ein/aus
+        'telegram_on_warn': '1',    # Auch bei WARNUNG senden
     }
     for key, val in defaults.items():
         cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, val))
@@ -212,9 +322,229 @@ def init_db():
 
 init_db()
 
-# ============================================================
-# --- REALTIME ALARM STATE ---
-# ============================================================
+def migrate_db():
+    """
+    Bulletproof-Migration: Prüft jede Tabelle und Spalte.
+    Wenn ALTER TABLE nicht ausreicht, wird die Tabelle neu erstellt
+    und die vorhandenen Daten kopiert (SQLite-sicherer Weg).
+    Idempotent – sicher bei jedem Neustart.
+    """
+    conn = sqlite3.connect("sentinel.db")
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    def get_columns(table):
+        cursor.execute(f"PRAGMA table_info({table})")
+        return {row[1]: row for row in cursor.fetchall()}
+
+    def table_exists(table):
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        )
+        return cursor.fetchone() is not None
+
+    def safe_add_col(table, col, coltype, default=None):
+        """Spalte hinzufügen; fängt alle Fehler ab."""
+        if not table_exists(table):
+            return
+        cols = get_columns(table)
+        if col in cols:
+            return
+        try:
+            if default is not None:
+                cursor.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {col} {coltype} DEFAULT {default}"
+                )
+            else:
+                cursor.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {col} {coltype}"
+                )
+        except Exception:
+            pass  # Spalte konnte nicht hinzugefügt werden – kein Absturz
+
+    def recreate_table(table, new_ddl, required_cols):
+        """
+        Erstellt die Tabelle neu mit neuen Spalten.
+        Kopiert alle vorhandenen Spalten (Schnittmenge) aus der alten Tabelle.
+        Fehlende Spalten werden mit NULL / DEFAULT befüllt.
+        """
+        if not table_exists(table):
+            cursor.execute(new_ddl)
+            return
+        existing_cols = set(get_columns(table).keys())
+        needed_cols   = set(required_cols)
+        missing       = needed_cols - existing_cols
+        if not missing:
+            return  # Alle Spalten vorhanden – nichts zu tun
+        # Rename old table
+        cursor.execute(f"ALTER TABLE {table} RENAME TO _{table}_old")
+        # Create new table
+        cursor.execute(new_ddl)
+        # Copy data for columns that existed before
+        copy_cols = existing_cols & needed_cols
+        cols_str  = ", ".join(copy_cols)
+        cursor.execute(
+            f"INSERT INTO {table} ({cols_str}) SELECT {cols_str} FROM _{table}_old"
+        )
+        cursor.execute(f"DROP TABLE _{table}_old")
+
+    # ── history ──────────────────────────────────────────────
+    recreate_table(
+        "history",
+        """CREATE TABLE history (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               time TEXT, level INTEGER,
+               status TEXT, detail TEXT,
+               timestamp_raw DATETIME
+           )""",
+        ["id", "time", "level", "status", "detail", "timestamp_raw"]
+    )
+
+    # ── email_scan_results ───────────────────────────────────
+    recreate_table(
+        "email_scan_results",
+        """CREATE TABLE email_scan_results (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               time TEXT, email_from TEXT, subject TEXT,
+               verdict TEXT, risk_score INTEGER,
+               detail TEXT, account TEXT
+           )""",
+        ["id", "time", "email_from", "subject", "verdict", "risk_score", "detail", "account"]
+    )
+
+    # ── alarm_log ────────────────────────────────────────────
+    if not table_exists("alarm_log"):
+        cursor.execute("""CREATE TABLE alarm_log (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               time TEXT, severity TEXT, category TEXT,
+               message TEXT, ip TEXT, confirmed INTEGER DEFAULT 0
+           )""")
+
+    # ── compliance_reports ───────────────────────────────────
+    if not table_exists("compliance_reports"):
+        cursor.execute("""CREATE TABLE compliance_reports (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               time TEXT, period TEXT, pdf_path TEXT,
+               sent_to TEXT, status TEXT
+           )""")
+
+    # ── fingerprints ─────────────────────────────────────────
+    if not table_exists("fingerprints"):
+        cursor.execute("""CREATE TABLE fingerprints (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               fp_id TEXT UNIQUE, ip TEXT, user_agent TEXT,
+               accept_lang TEXT, accept_encoding TEXT, connection_type TEXT,
+               is_vpn INTEGER DEFAULT 0, is_tor INTEGER DEFAULT 0,
+               is_proxy INTEGER DEFAULT 0, is_datacenter INTEGER DEFAULT 0,
+               is_headless INTEGER DEFAULT 0, is_bot INTEGER DEFAULT 0,
+               risk_score INTEGER DEFAULT 0, status TEXT DEFAULT 'normal',
+               blocked INTEGER DEFAULT 0, first_seen TEXT, last_seen TEXT,
+               request_count INTEGER DEFAULT 1, detail TEXT
+           )""")
+    else:
+        for col, typ, dflt in [
+            ("is_vpn","INTEGER",0),("is_tor","INTEGER",0),
+            ("is_proxy","INTEGER",0),("is_datacenter","INTEGER",0),
+            ("is_headless","INTEGER",0),("is_bot","INTEGER",0),
+            ("risk_score","INTEGER",0),("status","TEXT",None),
+            ("blocked","INTEGER",0),("first_seen","TEXT",None),
+            ("last_seen","TEXT",None),("request_count","INTEGER",1),
+            ("detail","TEXT",None),
+        ]:
+            safe_add_col("fingerprints", col, typ, dflt)
+
+    # ── fp_behaviour ─────────────────────────────────────────
+    if not table_exists("fp_behaviour"):
+        cursor.execute("""CREATE TABLE fp_behaviour (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               fp_id TEXT, time TEXT, event_type TEXT, data TEXT
+           )""")
+
+    # ── bruteforce_alerts ────────────────────────────────────
+    if not table_exists("bruteforce_alerts"):
+        cursor.execute("""CREATE TABLE bruteforce_alerts (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               time TEXT, source_ip TEXT, request_count INTEGER,
+               window_seconds INTEGER, path TEXT,
+               blocked INTEGER DEFAULT 1
+           )""")
+
+    # ── exploit_alerts ───────────────────────────────────────
+    if not table_exists("exploit_alerts"):
+        cursor.execute("""CREATE TABLE exploit_alerts (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               time TEXT, source_ip TEXT, pattern_name TEXT,
+               payload_snippet TEXT, confidence INTEGER,
+               blocked INTEGER DEFAULT 1
+           )""")
+
+    # ── honeytoken_alerts ────────────────────────────────────
+    if not table_exists("honeytoken_alerts"):
+        cursor.execute("""CREATE TABLE honeytoken_alerts (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               time TEXT, token_id TEXT, token_label TEXT,
+               attacker_ip TEXT, user_agent TEXT,
+               path TEXT, method TEXT, severity TEXT
+           )""")
+
+    # ── honeytokens ──────────────────────────────────────────
+    if not table_exists("honeytokens"):
+        cursor.execute("""CREATE TABLE honeytokens (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               token_id TEXT UNIQUE, token_type TEXT, label TEXT,
+               fake_value TEXT, route TEXT, created TEXT,
+               last_triggered TEXT,
+               trigger_count INTEGER DEFAULT 0,
+               active INTEGER DEFAULT 1
+           )""")
+
+    # ── safety_checks ────────────────────────────────────────
+    if not table_exists("safety_checks"):
+        cursor.execute("""CREATE TABLE safety_checks (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               time TEXT, check_type TEXT, component TEXT,
+               status TEXT, detail TEXT
+           )""")
+
+    # ── email_accounts ───────────────────────────────────────
+    if not table_exists("email_accounts"):
+        cursor.execute("""CREATE TABLE email_accounts (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               provider TEXT, email TEXT, imap_host TEXT,
+               imap_port INTEGER, password TEXT,
+               active INTEGER DEFAULT 1
+           )""")
+
+    # ── settings: alle Keys sicherstellen ───────────────────
+    all_defaults = {
+        'retention_days': '30', 'ai_model': 'tinyllama', 'ai_active': '1',
+        'blacklist': 'Geheim,Passwort,Kontostand,Personalakte',
+        'company_name': 'Deine Firma GmbH', 'email_scan_active': '1',
+        'virustotal_api_key': '', 'honeytokens_active': '1',
+        'exploit_detection_active': '1', 'memory_safety_active': '1',
+        'rate_limit_max': '60', 'rate_limit_window': '60',
+        'fp_auto_block': '0', 'fp_block_threshold': '70',
+        'alarm_log_active': '1',
+        'alert_email_to': '', 'alert_email_from': '',
+        'alert_smtp_host': '', 'alert_smtp_port': '587',
+        'alert_smtp_user': '', 'alert_smtp_pass': '',
+        'compliance_ceo_email': '', 'compliance_security_email': '',
+        'compliance_auto_send': '0', 'company_address': '',
+        'company_logo_text': 'SENTINEL SME-GUARDIAN',
+        'telegram_token': '', 'telegram_chat_id': '',
+        'telegram_active': '1', 'telegram_on_warn': '1',
+    }
+    for k, v in all_defaults.items():
+        cursor.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES (?,?)", (k, v)
+        )
+
+    conn.commit()
+    conn.close()
+
+migrate_db()
+
+
 import queue
 _alarm_queue: queue.Queue = queue.Queue(maxsize=200)
 
@@ -253,6 +583,9 @@ def push_alarm(severity: str, category: str, message: str, ip: str = ""):
     # Send email alert for KRITISCH events
     if severity == "KRITISCH":
         _send_alert_email_async(category, message, ip)
+    # Send Telegram alert for KRITISCH and WARNUNG
+    if severity in ("KRITISCH", "WARNUNG"):
+        _fire_telegram(severity, category, message, ip)
 
 import smtplib
 from email.mime.text import MIMEText
@@ -2117,6 +2450,65 @@ async def trigger_update_check():
     asyncio.create_task(_check_and_apply_update())
     return {"message": "Update-Check gestartet. Logs pruefen fuer Ergebnis."}
 
+# ============================================================
+# --- TELEGRAM ENDPOINTS ---
+# ============================================================
+@app.get("/telegram/settings")
+def get_telegram_settings():
+    conn = sqlite3.connect("sentinel.db")
+    cursor = conn.cursor()
+    fields = ['telegram_token','telegram_chat_id','telegram_active','telegram_on_warn']
+    result = {}
+    for f in fields:
+        cursor.execute("SELECT value FROM settings WHERE key=?", (f,))
+        r = cursor.fetchone(); result[f] = r[0] if r else ''
+    # Mask token for display: show only last 6 chars
+    tok = result.get('telegram_token','')
+    result['telegram_token_masked'] = ('*' * max(0, len(tok)-6) + tok[-6:]) if tok else ''
+    result['key_file_exists'] = os.path.isfile(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "sentinel.key"))
+    result['key_loaded'] = bool(TELEGRAM_TOKEN)
+    conn.close()
+    return result
+
+@app.post("/telegram/settings")
+async def save_telegram_settings(request: Request):
+    data = await request.json()
+    fields = ['telegram_token','telegram_chat_id','telegram_active','telegram_on_warn']
+    conn = sqlite3.connect("sentinel.db")
+    cursor = conn.cursor()
+    for f in fields:
+        if f in data:
+            cursor.execute("UPDATE settings SET value=? WHERE key=?", (str(data[f]), f))
+    conn.commit(); conn.close()
+    return {"success": True}
+
+@app.post("/telegram/test")
+async def test_telegram():
+    """Sendet eine Test-Nachricht über Telegram."""
+    conn = sqlite3.connect("sentinel.db")
+    cursor = conn.cursor()
+    def gs(k, d=''):
+        cursor.execute("SELECT value FROM settings WHERE key=?", (k,))
+        r = cursor.fetchone(); return r[0] if r else d
+    db_token  = gs('telegram_token', '')
+    db_chat   = gs('telegram_chat_id', '')
+    conn.close()
+    token   = TELEGRAM_TOKEN   or db_token
+    chat_id = TELEGRAM_CHAT_ID or db_chat
+    if not token or not chat_id:
+        return JSONResponse(status_code=400,
+            content={"error": "Kein Telegram Token/Chat-ID konfiguriert."})
+    now = datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+    text = (
+        f"✅ *SENTINEL TEST*\n\n"
+        f"📋 Verbindungstest erfolgreich!\n"
+        f"🏢 Sentinel SME-Guardian\n"
+        f"🕐 {now}"
+    )
+    await _send_telegram_direct(token, chat_id, text)
+    return {"success": True, "message": "Test-Nachricht gesendet."}
+
 @app.post("/toggle_ai")
 async def toggle_ai():
     conn = sqlite3.connect("sentinel.db")
@@ -3238,6 +3630,54 @@ input:checked+.slider:before{{transform:translateX(22px);}}
     </div>
   </div>
   <div class="card">
+    <h3>📱 Telegram-Benachrichtigungen</h3>
+    <p style="color:#90a4ae;font-size:0.83rem;">
+      Bei jedem Alarm (KRITISCH/WARNUNG) wird sofort eine Nachricht an Telegram gesendet.
+      Token und Chat-ID entweder direkt eingeben oder verschlüsselt via <code>sentinel.key</code> laden.
+    </p>
+    <div class="grid" style="margin-bottom:12px;">
+      <div class="info-box" style="margin:0;padding:10px 14px;">
+        <small style="color:#90a4ae;">Schlüsseldatei (sentinel.key)</small><br>
+        <span id="tg_key_status" style="font-weight:bold;">Prüfe...</span>
+      </div>
+      <div class="info-box" style="margin:0;padding:10px 14px;">
+        <small style="color:#90a4ae;">Status</small><br>
+        <span id="tg_active_status" style="font-weight:bold;">–</span>
+      </div>
+    </div>
+    <div class="toggle-wrap" style="margin-bottom:10px;">
+      <label class="toggle">
+        <input type="checkbox" id="telegram_active" onchange="saveTelegramSettings()">
+        <span class="slider"></span>
+      </label>
+      <span>Telegram-Benachrichtigungen aktiv</span>
+    </div>
+    <div class="toggle-wrap" style="margin-bottom:12px;">
+      <label class="toggle">
+        <input type="checkbox" id="telegram_on_warn" onchange="saveTelegramSettings()">
+        <span class="slider"></span>
+      </label>
+      <span>Auch bei WARNUNG senden (nicht nur KRITISCH)</span>
+    </div>
+    <label>Bot-Token (von @BotFather):</label>
+    <input type="password" id="telegram_token" placeholder="123456:ABC-DEF... (bleibt leer wenn sentinel.key aktiv)">
+    <label>Chat-ID (von @userinfobot):</label>
+    <input type="text" id="telegram_chat_id" placeholder="Deine Telegram Chat-ID">
+    <div class="info-box" style="margin-top:10px;font-size:0.8rem;">
+      <strong>So einrichten:</strong><br>
+      1. Telegram öffnen → @BotFather → /newbot → Token kopieren<br>
+      2. @userinfobot schreiben → deine Chat-ID notieren<br>
+      3. Token + Chat-ID hier eingeben und speichern<br>
+      4. Test senden → du erhältst eine Nachricht auf dem Handy<br>
+      <strong>Alternativ:</strong> Verschlüsselt via <code>sentinel.key</code> (sicherer für Produktion)
+    </div>
+    <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+      <button class="btn btn-green" onclick="saveTelegramSettings()">Speichern</button>
+      <button class="btn btn-teal" onclick="testTelegram()">TEST SENDEN</button>
+      <span id="tg_test_msg" style="color:#90a4ae;font-size:0.83rem;"></span>
+    </div>
+  </div>
+  <div class="card">
     <h3>Auto-Update</h3>
     <div class="grid3">
       <div class="info-box" style="margin:0;">
@@ -3283,7 +3723,7 @@ function showTab(id, btn) {{
   if(id==='tab-fingerprint')    {{ loadFingerprints(); loadFpStats(); }}
   if(id==='tab-alarmlog')       loadAlarmLog();
   if(id==='tab-compliance')     {{ loadComplianceHistory(); loadComplianceSettings(); }}
-  if(id==='tab-settings')       loadAlarmSettings();
+  if(id==='tab-settings')       {{ loadAlarmSettings(); loadTelegramSettings(); }}
 }}
 
 // ── REALTIME ALARM SYSTEM ─────────────────────────────────────
@@ -4019,6 +4459,90 @@ async function testOutlookScan() {{
   `;
 }}
 
+// ── TELEGRAM SETTINGS ────────────────────────────────────────
+async function loadTelegramSettings() {{
+  try {{
+    const res  = await fetch('/telegram/settings');
+    const data = await res.json();
+    // Toggle states
+    const actToggle  = document.getElementById('telegram_active');
+    const warnToggle = document.getElementById('telegram_on_warn');
+    if(actToggle)  actToggle.checked  = data.telegram_active  === '1';
+    if(warnToggle) warnToggle.checked = data.telegram_on_warn === '1';
+    // Token (masked) – don't pre-fill password field, show hint
+    const tokField = document.getElementById('telegram_token');
+    if(tokField && data.telegram_token_masked)
+      tokField.placeholder = 'Gespeichert: ' + data.telegram_token_masked;
+    // Chat ID
+    const chatField = document.getElementById('telegram_chat_id');
+    if(chatField) chatField.value = data.telegram_chat_id || '';
+    // Status indicators
+    const keyStatus = document.getElementById('tg_key_status');
+    const actStatus = document.getElementById('tg_active_status');
+    if(keyStatus) {{
+      keyStatus.textContent = data.key_file_exists
+        ? (data.key_loaded ? '✅ sentinel.key aktiv' : '⚠️ Datei gefunden, Fehler beim Laden')
+        : '❌ Nicht gefunden (DB-Modus)';
+      keyStatus.style.color = data.key_loaded ? '#10b981' : data.key_file_exists ? '#fbbf24' : '#90a4ae';
+    }}
+    if(actStatus) {{
+      actStatus.textContent = data.telegram_active === '1' ? '✅ Aktiv' : '⏸ Deaktiviert';
+      actStatus.style.color = data.telegram_active === '1' ? '#10b981' : '#f87171';
+    }}
+  }} catch(e) {{}}
+}}
+
+async function saveTelegramSettings() {{
+  const token   = document.getElementById('telegram_token').value;
+  const chat_id = document.getElementById('telegram_chat_id').value;
+  const active  = document.getElementById('telegram_active').checked  ? '1' : '0';
+  const on_warn = document.getElementById('telegram_on_warn').checked ? '1' : '0';
+  const body = {{ telegram_active: active, telegram_on_warn: on_warn }};
+  if(token)   body.telegram_token   = token;
+  if(chat_id) body.telegram_chat_id = chat_id;
+  const res = await fetch('/telegram/settings', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify(body)
+  }});
+  const d = await res.json();
+  if(d.success) {{
+    alert('Telegram-Einstellungen gespeichert!');
+    loadTelegramSettings();
+  }}
+}}
+
+async function testTelegram() {{
+  const msg = document.getElementById('tg_test_msg');
+  msg.textContent = 'Sende...';
+  try {{
+    // Save first in case token was just entered
+    const token   = document.getElementById('telegram_token').value;
+    const chat_id = document.getElementById('telegram_chat_id').value;
+    if(token || chat_id) {{
+      const b = {{}};
+      if(token)   b.telegram_token   = token;
+      if(chat_id) b.telegram_chat_id = chat_id;
+      await fetch('/telegram/settings', {{
+        method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(b)
+      }});
+    }}
+    const res = await fetch('/telegram/test', {{method:'POST'}});
+    const d   = await res.json();
+    if(d.success) {{
+      msg.textContent = '✅ Test gesendet! Prüfe dein Telegram.';
+      msg.style.color = '#10b981';
+    }} else {{
+      msg.textContent = '❌ ' + (d.error || 'Fehler');
+      msg.style.color = '#f87171';
+    }}
+  }} catch(e) {{
+    msg.textContent = '❌ Verbindungsfehler: ' + e;
+    msg.style.color = '#f87171';
+  }}
+  setTimeout(() => {{ msg.textContent = ''; }}, 6000);
+}}
+
 // ── AUTO-UPDATE ──────────────────────────────────────────────
 async function triggerUpdateCheck() {{
   const msg = document.getElementById('updateCheckMsg');
@@ -4046,7 +4570,8 @@ async function checkVersionDisplay() {{
 connectSSE();
 loadFpSnippet();
 loadAlarmSettings();
+loadTelegramSettings();
 checkVersionDisplay();
 </script>
 </body>
-</html>"""    
+</html>"""
